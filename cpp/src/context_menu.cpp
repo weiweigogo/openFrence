@@ -256,7 +256,15 @@ static void WalkMenu(HMENU m, std::vector<CtxItem>& out,
         CtxItem it;
         if (mii.fType & MFT_SEPARATOR) { it.sep = true; out.push_back(std::move(it)); continue; }
 
-        it.text = text;
+        // DirectWrite does not interpret Win32 menu mnemonic markers.
+        // Hide single '&' markers, but preserve escaped literal ampersands.
+        for (size_t j = 0; text[j]; ++j) {
+            if (text[j] == L'&') {
+                if (text[j + 1] != L'&') continue;
+                ++j;
+            }
+            it.text += text[j];
+        }
         it.id = mii.wID;
         it.disabled = (mii.fState & (MFS_DISABLED | MFS_GRAYED)) != 0;
         it.checked = (mii.fState & MFS_CHECKED) != 0;
