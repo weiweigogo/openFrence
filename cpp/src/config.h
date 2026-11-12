@@ -7,10 +7,11 @@
 /// App-wide persistence.
 ///
 /// State lives in ONE JSON file, %APPDATA%\openFences\config.json
-/// (nlohmann/json): language, the "hide all fences" flag, and every fence
-/// with its layout, per-fence appearance and icons. The autostart flag is
-/// deliberately NOT in this file — Windows reads it from the HKCU Run key,
-/// so the registry value is the single source of truth for it.
+/// (nlohmann/json): language, the "hide all fences" flag, the "hide desktop
+/// icons" flag, and every fence with its layout, per-fence appearance and
+/// icons. The autostart flag is deliberately NOT in this file — Windows
+/// reads it from the HKCU Run key, so the registry value is the single
+/// source of truth for it.
 ///
 /// Writes are debounced (Config::MarkDirty) because many interactions fire
 /// bursts of changes (drag = dozens of moves); a normal exit saves once more
