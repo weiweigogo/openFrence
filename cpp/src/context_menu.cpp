@@ -191,7 +191,7 @@ struct MenuPopup {
     std::vector<CComPtr<IDWriteTextLayout>> texts;   // one per row (null = separator)
     CComPtr<ID2D1SolidColorBrush> brTint, brBorder, brHi, brText, brDim,
                                   brHover, brPressed, brSep, brChev, brCheck,
-                                  brShadow;
+                                  brBadge, brShadow;
     CComPtr<ID2D1BitmapBrush> backBrush;   // fallback if no backdrop
 
     bool Create(MenuSession* se, const std::vector<CtxItem>* it, int dep,
@@ -564,6 +564,9 @@ void MenuPopup::MakeBrushes() {
     mk(1, 1, 1, 0.08f, &brSep);
     mk(1, 1, 1, 0.60f, &brChev);
     mk(1, 1, 1, 0.90f, &brCheck);
+    // Checked-state badge over a glyph bitmap: Windows accent blue, the same
+    // hue the system uses for on-toggles.
+    mk(0.0f, 0.47f, 0.83f, 1.0f, &brBadge);
     // Shadow bands share one brush; DrawMenu retunes its alpha per band
     // (the redraw path must not allocate).
     mk(0, 0, 0, 1.0f, &brShadow);
@@ -698,6 +701,21 @@ void MenuPopup::DrawMenu() {
         if (i < icons.size() && icons[i]) {
             t->DrawBitmap(icons[i].p, D2D1_RECT_F{ ix, iy, ix + iconSz, iy + iconSz },
                           it.disabled ? 0.4f : 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+            // A glyphed toggle (tray menu's Start with Windows) cannot use the
+            // gutter check mark — the bitmap already fills the column, so on
+            // and off would render identically. Pin a small accent badge to
+            // the glyph corner while the item is checked instead.
+            if (it.checked && !it.disabled) {
+                float r  = 4.2f * s;
+                float cx = ix + iconSz - r * 0.55f, cy = iy + iconSz - r * 0.55f;
+                t->FillEllipse({ {cx, cy}, r, r }, brBadge.p);
+                t->DrawLine({ cx - r * 0.42f, cy + r * 0.02f },
+                            { cx - r * 0.08f, cy + r * 0.34f },
+                            brCheck.p, 1.6f * s);
+                t->DrawLine({ cx - r * 0.08f, cy + r * 0.34f },
+                            { cx + r * 0.46f, cy - r * 0.30f },
+                            brCheck.p, 1.6f * s);
+            }
         } else if (it.checked) {
             float cx = padH + mt.iconCol * s * 0.5f, cy = top + rh * 0.5f;
             t->DrawLine({ cx - 4.0f * s, cy },        { cx - 1.2f * s, cy + 2.8f * s },

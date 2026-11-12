@@ -43,6 +43,17 @@ target_link_options(openfences PRIVATE
     "/MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/src/app.manifest")
 
 target_include_directories(openfences PRIVATE src)
+
+# Toolchains installed without the ATL component (VS BuildTools) still need
+# CComPtr: fall back to our minimal atlcompat/atlbase.h shim. A full VS
+# install keeps its real ATL — the shim directory is only added when the
+# toolset's atlmfc headers are absent.
+get_filename_component(_msvc_bindir "${CMAKE_CXX_COMPILER}" DIRECTORY)      # …/bin/Hostx64/x64
+get_filename_component(_msvc_root "${_msvc_bindir}/../../.." ABSOLUTE)      # …/MSVC/<ver>
+if(NOT EXISTS "${_msvc_root}/atlmfc/include/atlbase.h")
+    message(STATUS "ATL headers not found — using the atlcompat CComPtr shim")
+    target_include_directories(openfences PRIVATE atlcompat)
+endif()
 target_link_libraries(openfences PRIVATE
     d2d1 dwrite windowscodecs
     ole32 shlwapi shell32 comctl32 comdlg32

@@ -12,6 +12,8 @@ using json = nlohmann::json;
 // App state owned by main.cpp — serialized here on save, rebuilt on load.
 extern std::vector<std::unique_ptr<FenceWindow>> g_fences;
 extern bool g_allHidden;
+extern bool g_deskHidden;   // tray "hide desktop icons" toggle; replayed by
+                            // main.cpp's ApplyDesktopIconsHidden on startup
 
 namespace {
 
@@ -156,9 +158,10 @@ const std::wstring& Path() {
 
 bool SaveNow() {
     json j;
-    j["version"]  = 1;
-    j["language"] = FenceWindow::GetLanguage();
-    j["hideAll"]  = g_allHidden;
+    j["version"]    = 1;
+    j["language"]   = FenceWindow::GetLanguage();
+    j["hideAll"]    = g_allHidden;
+    j["deskHidden"] = g_deskHidden;
     json fences = json::array();
     for (const auto& f : g_fences)
         fences.push_back(SaveFence(*f));
@@ -226,6 +229,9 @@ bool LoadApp() {
     g_allHidden = j.value("hideAll", false);
     if (g_allHidden)
         for (auto& f : g_fences) f->Hide();
+    // The hide itself is replayed by main.cpp (ApplyDesktopIconsHidden) once
+    // the desktop tree is up — parking the fences needs its helpers.
+    g_deskHidden = j.value("deskHidden", false);
     return true;
 }
 

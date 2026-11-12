@@ -136,7 +136,7 @@ void AddTrayIcon(HWND hwnd) {
 }
 
 bool g_allHidden = false;        // extern'd by config.cpp (persisted)
-static bool g_deskHidden = false;
+bool g_deskHidden = false;       // extern'd by config.cpp (persisted)
 // Set by WatchDesktopIconVisibility when EXPLORER hid the icon list (desktop
 // right-click → View → Show desktop icons) and the fences were parked on
 // SHELLDLL_DefView to survive it. Distinct from g_deskHidden, which means WE
@@ -160,6 +160,25 @@ void ToggleDesktopIcons() {
         for (auto& f : g_fences) ReparentFence(f->Hwnd(), lv);
         g_deskHidden = false;
     }
+    Config::MarkDirty();   // survive an app restart (explorer resets the list)
+}
+
+// Re-apply the persisted "desktop icons hidden" state onto the live desktop
+// tree. Explorer always recreates its icon list visible — on app start and
+// after an explorer restart — so the saved hide has to be replayed here,
+// parking the fences on SHELLDLL_DefView exactly like ToggleDesktopIcons.
+// At a Run-key launch the desktop tree may not exist yet; that must NOT
+// clear the state (the old drop-on-fail left the icons up for the whole
+// session) — this returns without doing anything and the timer-2 tick
+// retries every 300 ms until the list appears. Applied-state ticks are
+// no-ops (parents match, the list is already hidden).
+static void ApplyDesktopIconsHidden() {
+    if (!g_deskHidden) return;
+    HWND lv = FindDesktopLV();
+    HWND defview = lv ? GetParent(lv) : nullptr;
+    if (!lv || !defview) return;   // desktop not up yet; retry on next tick
+    for (auto& f : g_fences) ReparentFence(f->Hwnd(), defview);
+    ShowWindow(lv, SW_HIDE);
 }
 
 // Explorer's own "Show desktop icons" switch (desktop context menu → View)
@@ -311,7 +330,8 @@ void ShowTrayMenu(HWND hwnd) {
         CreateDesktopShortcut();
     } else if (cmd == 102) {
         Config::SaveNow();   // do not ride on the debounce for a real exit
-        Shell_NotifyIconW(NIM_DELETE, &NOTIFYICONDATAW{sizeof(NOTIFYICONDATAW), hwnd, 1});
+        NOTIFYICONDATAW nid = { sizeof(NOTIFYICONDATAW), hwnd, 1 };
+        Shell_NotifyIconW(NIM_DELETE, &nid);
         PostQuitMessage(0);
     }
 }
@@ -344,16 +364,7 @@ static void RebuildFences() {
     // The fresh desktop came back with its icons visible; if the user had
     // them hidden, re-hide them (and park the fences on SHELLDLL_DefView
     // again, exactly like ToggleDesktopIcons does).
-    if (g_deskHidden) {
-        HWND lv = FindDesktopLV();
-        HWND defview = lv ? GetParent(lv) : nullptr;
-        if (lv && defview) {
-            for (auto& f : g_fences) ReparentFence(f->Hwnd(), defview);
-            ShowWindow(lv, SW_HIDE);
-        } else {
-            g_deskHidden = false;   // no icon list right now; drop stale state
-        }
-    }
+    ApplyDesktopIconsHidden();
 }
 
 LRESULT CALLBACK OwnerWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -375,6 +386,9 @@ LRESULT CALLBACK OwnerWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_TIMER:
         if (wp == 2) {   // desktop icon-size watcher
+            // Keep replaying a persisted hide until the icon list exists
+            // (a Run-key boot launch can beat explorer's desktop tree).
+            ApplyDesktopIconsHidden();
             // Keep fences alive across explorer's own icon hide/show.
             WatchDesktopIconVisibility();
             // One live measurement per tick, shared by all fences (the query
@@ -406,7 +420,8 @@ LRESULT CALLBACK OwnerWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_DESTROY:
         Config::SaveNow();   // safety net; the tray Exit path saves too
-        Shell_NotifyIconW(NIM_DELETE, &NOTIFYICONDATAW{sizeof(NOTIFYICONDATAW), hwnd, 1});
+        NOTIFYICONDATAW nid = { sizeof(NOTIFYICONDATAW), hwnd, 1 };
+        Shell_NotifyIconW(NIM_DELETE, &nid);
         PostQuitMessage(0); return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
@@ -461,9 +476,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
             g_fences.push_back(std::make_unique<FenceWindow>(fd));
     }
 
-    // If explorer's icons are hidden right now (we restarted, or the user
-    // hid them before launching us), park immediately instead of sitting
-    // invisible under the hidden list until the first timer-2 tick.
+    // Replay OUR persisted hide (config deskHidden) right away — explorer
+    // reset the list to visible on its way up. When a Run-key launch beat
+    // the desktop tree, the timer-2 tick keeps retrying until it exists.
+    ApplyDesktopIconsHidden();
     WatchDesktopIconVisibility();
 
     // ScanAndConstrainIcons disabled for now — cross-process SendMessage
