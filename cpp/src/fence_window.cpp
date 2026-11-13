@@ -4,16 +4,45 @@
 #include "menu_icons.h"
 #include "config.h"
 #include "explorer_sort.h"
+#include "zoom_overlay.h"
 #include <windowsx.h>
 #include <shellapi.h>
 #include <shlobj.h>     // IShellFolder, PIDL helpers (shell context menu)
 #include <shobjidl.h>   // IContextMenu
 #include <shlwapi.h>
 #include <commctrl.h>   // TrackMouseEvent (hover leave tracking)
+#include <timeapi.h>    // timeBeginPeriod: 1ms timer resolution for 60fps
+#pragma comment(lib, "winmm.lib")
 #include <cmath>
+#include <chrono>
+#include <cstdarg>
+#include <cstdio>
+
+// App state owned by main.cpp — ZoomHideOthers/ZoomRestoreOthers walk the
+// list, and g_allHidden decides whether "the others" may come back at all.
+extern std::vector<std::unique_ptr<FenceWindow>> g_fences;
+extern bool g_allHidden;
+
+// Phone-folder zoom tuning (see ZoomOpen): animation cadence and the icon
+// growth factor applied to the fence's glyph/cell metrics while zoomed.
+constexpr UINT  kZoomTimerId    = 6;
+constexpr int   kZoomFrameMs    = 8;
+constexpr UINT  WM_APP_ZOOM_TICK = WM_APP + 0x51;
+
+constexpr float kZoomMaxScale   = 2.4f; // cap on the computed glyph growth
+constexpr int   kZoomDurationMs = 320;  // time-based flight, not frame count
+
+static float EaseInOutCubic(float u) {
+    if (u <= 0.0f) return 0.0f;
+    if (u >= 1.0f) return 1.0f;
+    return (u < 0.5f) ? 4.0f * u * u * u
+                      : 1.0f - (-2.0f * u + 2.0f) * (-2.0f * u + 2.0f)
+                                   * (-2.0f * u + 2.0f) * 0.5f;
+}
 
 HWND FenceWindow::s_owner = nullptr;
 int  FenceWindow::s_lang = 1; // 0=EN, 1=ZH — default Chinese
+bool FenceWindow::s_teardown = false;
 
 const wchar_t* FenceWindow::Loc(const wchar_t* en, const wchar_t* zh) {
     return s_lang == 1 ? zh : en;
@@ -263,6 +292,8 @@ FenceWindow::FenceWindow(const FenceData& data)
 }
 
 FenceWindow::~FenceWindow() {
+    ZoomStopTicker();
+    if (m_zoomOpening) timeEndPeriod(1);
     // If the settings panel is open for this fence, tear it down first so it
     // never keeps referencing a fence that is going away.
     SettingsPanel::CloseActiveFor(this);
@@ -279,7 +310,7 @@ FenceWindow::~FenceWindow() {
 void FenceWindow::Show() { m_appHidden = false; ShowWindow(m_hwnd, SW_SHOW); Redraw(); }
 void FenceWindow::Hide() { m_appHidden = true;  ShowWindow(m_hwnd, SW_HIDE); }
 
-void FenceWindow::Redraw() {
+void FenceWindow::DrawContent(float drawW, float drawH, bool noBackdrop) {
     ClampListScroll();
     std::wstring displayTitle = m_renaming
         ? (m_renameBuf + (m_cursorVisible ? L"|" : L""))
@@ -311,9 +342,36 @@ void FenceWindow::Redraw() {
                         m_dragMoved && m_dragIcon >= 0,
                         showMarq ? &marq : nullptr,
                         m_chevronHover, m_chevronDown,
-                        m_listScroll, &view);
+                        m_listScroll, &view, noBackdrop, drawW, drawH);
     m_render->EndDraw();
-    m_render->Present(m_hwnd, m_x, m_y);
+}
+
+void FenceWindow::Redraw() {
+    // Any repaint that arrives mid-flight (hover, backdrop timer, external
+    // invalidate) must present at the CURRENT window size. Presenting the
+    // target-size canvas would snap the window to its landing rect and the
+    // next animation tick would yank it back — a visible mid-flight jump.
+    if (m_zoomOpening && m_hwnd && IsWindow(m_hwnd)) {
+        RECT wr = {};
+        if (GetWindowRect(m_hwnd, &wr)) {
+            int w = wr.right - wr.left, h = wr.bottom - wr.top;
+            if (w > 0 && h > 0) {
+                DrawContent((float)w, (float)h, true);
+                m_render->PresentCropped(m_hwnd, wr.left, wr.top, w, h);
+                return;
+            }
+        }
+    }
+    DrawContent();
+    // Present from the LIVE window rect, never from the cached m_x/m_y: the
+    // cached pair is only refreshed in WM_WINDOWPOSCHANGED, and any repaint
+    // fired between a SetWindowPos and that notification used to drag the
+    // window back to its old rect (the zoom appeared to snap home mid-flight).
+    RECT wr = {};
+    if (m_hwnd && GetWindowRect(m_hwnd, &wr))
+        m_render->Present(m_hwnd, wr.left, wr.top);
+    else
+        m_render->Present(m_hwnd, m_x, m_y);
 }
 
 void FenceWindow::SetIcons(const std::vector<IconEntry>& entries) {
@@ -614,6 +672,13 @@ void FenceWindow::SyncDesktopIconSize(int physicalPx) {
     // fence being moved/resized, or a marquee on the move) works in the
     // current metrics; catch up instead.
     if (m_dragIcon >= 0 || m_moving || m_resizeMask || m_marquee) return;
+    // While zoomed the metrics are deliberately 1.5× the desktop's. Letting
+    // this poll adopt the desktop size would flip them back and forth on
+    // every 300ms tick (Adopt compares against the scaled imgSize, never
+    // matches, and relayouts the whole grid each time). The next tick after
+    // the zoom closes catches up with any desktop size change that happened
+    // in the meantime.
+    if (m_zoomed || m_zoomOpening) return;
     if (!m_render->AdoptDesktopIconSize(physicalPx)) return;
     if (m_collapsed) {
         // The grid cannot be rebuilt while folded (height = title bar only).
@@ -732,6 +797,9 @@ void FenceWindow::SetDragOver(bool over) {
 }
 
 void FenceWindow::ToggleCollapse() {
+    // Collapsing mid-zoom makes no sense (the zoom is a modal-ish viewing
+    // state); the chevron is also mostly off-screen against the shade.
+    if (m_zoomed || m_zoomOpening) return;
     int th = (int)(m_render->Appearance().titleH + 0.5f);
     int w  = (int)m_render->Width();
     if (m_collapsed) {
@@ -766,6 +834,369 @@ void FenceWindow::SyncCollapsedSize() {
         SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
+// Phone-folder zoom. Open: the fence flies from its current rect to a
+// centered one (58%/66% of its monitor's work area — modest on purpose, the
+// edges stay grabbable to fine-tune the size while zoomed) while the
+// ZoomOverlay shade fades in above the rest of the desktop and the OTHER
+// fences hide for the duration. The open animation's last step up-scales
+// the icon metrics and reflows the grid (phone folders grow their icons).
+// Close: metrics and icon positions are restored, the fence flies home, the
+// shade fades out and the siblings return. All of it rides timer 6 at
+// ~60 fps. Never persisted: while zoomed, GetData reports the base rect so
+// unrelated config saves cannot snapshot the fly-out geometry.
+void FenceWindow::ZoomHideOthers() {
+    m_zoomHidden.clear();
+    for (auto& f : g_fences) {
+        if (f.get() == this) continue;
+        HWND h = f->Hwnd();
+        // Only hide what the user can actually see. A sibling the shell
+        // already hid (Win+D, explorer restart) is not ours to reveal.
+        if (!h || !IsWindow(h) || !IsWindowVisible(h)) continue;
+        f->Hide();
+        m_zoomHidden.push_back(h);
+    }
+}
+
+void FenceWindow::ZoomRestoreOthers() {
+    if (s_teardown) { m_zoomHidden.clear(); return; }
+    // g_allHidden means the user hid every fence themselves — leave those
+    // hidden; only the fences WE hid come back.
+    if (g_allHidden) { m_zoomHidden.clear(); return; }
+    for (HWND h : m_zoomHidden) {
+        if (!IsWindow(h)) continue;
+        for (auto& f : g_fences) {
+            if (f->Hwnd() == h) { f->Show(); break; }
+        }
+    }
+    m_zoomHidden.clear();
+}
+
+void FenceWindow::ZoomPrepareTracks() {
+    FenceAppearance& app = m_render->Appearance();
+    m_zoomCellW = app.cellW;
+    m_zoomCellH = app.cellH;
+    m_zoomImg = app.imgSize;
+    m_zoomIconSize = app.iconSize;
+    m_zoomTracks.clear();
+    m_zoomTracks.reserve(m_icons.size());
+    for (const auto& ic : m_icons)
+        m_zoomTracks.push_back({ ic.path, ic.x, ic.y, ic.x, ic.y });
+
+    m_iconScaled = true;
+    if (app.displayMode != 0 || m_icons.empty()) {
+        // Lists just morph the window; their rows already read as rows.
+        m_zoomFinalCellW = m_zoomCellW;
+        m_zoomFinalCellH = m_zoomCellH;
+        m_zoomFinalImg = m_zoomImg;
+        return;
+    }
+
+    const int n = (int)m_icons.size();
+    int cols = (std::max)(1, (int)std::ceil(std::sqrt((double)n)));
+    int rows = (n + cols - 1) / cols;
+    const float top = ContentTop() + kGridPad;
+    const float availW = (std::max)(1.0f, (float)m_render->Width() - 2.0f * kGridPad);
+    const float availH = (std::max)(1.0f, (float)m_render->Height() - top - kGridPad);
+    float sw = availW / ((float)cols * app.cellW);
+    float sh = availH / ((float)rows * app.cellH);
+    float scale = (std::min)((std::min)(sw, sh), kZoomMaxScale);
+    if (scale < 1.0f) scale = 1.0f;
+
+    m_zoomFinalCellW = app.cellW * scale;
+    m_zoomFinalCellH = app.cellH * scale;
+    m_zoomFinalImg = app.imgSize * scale;
+
+    const float gridH = rows * m_zoomFinalCellH;
+    float startY = top + (availH - gridH) * 0.5f;
+    if (startY < top) startY = top;
+    for (int i = 0; i < n; i++) {
+        int r = i / cols;
+        int c = i % cols;
+        int rowCount = (std::min)(cols, n - r * cols);
+        float rowW = rowCount * m_zoomFinalCellW;
+        float rowX = ((float)m_render->Width() - rowW) * 0.5f;
+        m_zoomTracks[i].zoomX = rowX + c * m_zoomFinalCellW;
+        m_zoomTracks[i].zoomY = startY + r * m_zoomFinalCellH;
+    }
+
+    // Warm the per-path icon cache at the final glyph size. The animation
+    // then draws those bitmaps down-scaled instead of re-querying the shell
+    // for every frame.
+    app.cellW = m_zoomFinalCellW;
+    app.cellH = m_zoomFinalCellH;
+    app.imgSize = m_zoomFinalImg;
+    for (int i = 0; i < n; i++) {
+        m_icons[i].x = m_zoomTracks[i].zoomX;
+        m_icons[i].y = m_zoomTracks[i].zoomY;
+    }
+    m_render->WarmIcons(m_icons);
+}
+
+void FenceWindow::ZoomApplyFrame(float e, int curW, int curH) {
+    FenceAppearance& app = m_render->Appearance();
+    const float th = app.titleH;
+    const float baseW = (float)(std::max)(1, m_zoomBaseW);
+    const float baseH = (float)(std::max)(1, m_zoomBaseH);
+    const float targetW = (float)(std::max)(1, m_zoomTargetW);
+    const float targetH = (float)(std::max)(1, m_zoomTargetH);
+    const float bodyBase = (std::max)(1.0f, baseH - th);
+    const float bodyTarget = (std::max)(1.0f, targetH - th);
+    const float bodyCur = (std::max)(1.0f, (float)curH - th);
+    const float sxB = (float)curW / baseW;
+    const float syB = bodyCur / bodyBase;
+    const float sxZ = (float)curW / targetW;
+    const float syZ = bodyCur / bodyTarget;
+
+    if (app.displayMode == 0 && m_iconScaled && !m_zoomTracks.empty()) {
+        app.cellW = m_zoomCellW * sxB * (1.0f - e) + m_zoomFinalCellW * sxZ * e;
+        app.cellH = m_zoomCellH * syB * (1.0f - e) + m_zoomFinalCellH * syZ * e;
+        app.imgSize = m_zoomImg * sxB * (1.0f - e) + m_zoomFinalImg * sxZ * e;
+        if (app.cellW < 1.0f) app.cellW = 1.0f;
+        if (app.cellH < 1.0f) app.cellH = 1.0f;
+        if (app.imgSize < 1.0f) app.imgSize = 1.0f;
+
+        for (auto& ic : m_icons) {
+            const ZoomTrack* tr = nullptr;
+            for (const auto& t : m_zoomTracks) {
+                if (t.path == ic.path) { tr = &t; break; }
+            }
+            if (!tr) {
+                ic.x *= sxB;
+                ic.y = th + (ic.y - th) * syB;
+                continue;
+            }
+            float bx = tr->baseX * sxB;
+            float by = th + (tr->baseY - th) * syB;
+            float zx = tr->zoomX * sxZ;
+            float zy = th + (tr->zoomY - th) * syZ;
+            ic.x = bx + (zx - bx) * e;
+            ic.y = by + (zy - by) * e;
+        }
+    }
+}
+
+void FenceWindow::ZoomDrawFrame(int curW, int curH) {
+    DrawContent((float)curW, (float)curH, true);
+}
+
+void FenceWindow::ZoomOpen() {
+    if (m_zoomed || m_zoomOpening || m_collapsed) return;
+    if (!m_hwnd || !IsWindow(m_hwnd)) return;
+
+    RECT base = {};
+    if (!GetWindowRect(m_hwnd, &base)) return;
+
+    MONITORINFO mi = { sizeof(mi) };
+    GetMonitorInfoW(MonitorFromWindow(m_hwnd, MONITOR_DEFAULTTONEAREST), &mi);
+    int ww = mi.rcWork.right - mi.rcWork.left;
+    int wh = mi.rcWork.bottom - mi.rcWork.top;
+    int tw = ww * 58 / 100;
+    int th = wh * 66 / 100;
+    int tx = mi.rcWork.left + (ww - tw) / 2;
+    int ty = mi.rcWork.top + (wh - th) / 2;
+
+    m_zoomBaseX = base.left;
+    m_zoomBaseY = base.top;
+    m_zoomBaseW = (int)m_render->Width();
+    m_zoomBaseH = (int)m_render->Height();
+    m_zoomTargetW = tw;
+    m_zoomTargetH = th;
+    m_zoomBaseValid = true;
+
+    m_zoomed = true;
+    m_zoomClosing = false;
+    m_zoomOpening = true;
+    m_zoomFrame = 0;
+    m_zoomFrames = 1;      // time-based; kept for the watchdog
+
+    ZoomOverlay::OpenFor(this);
+    SetWindowPos(m_hwnd, HWND_TOP, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+
+    // One fixed target-size canvas for the whole flight. Per frame only the
+    // top-left current-size region is drawn and presented; the target never
+    // grows/shrinks, so D2D/WIC resources stay alive.
+    m_render->Resize(tw, th);
+    ZoomPrepareTracks();
+
+    m_zoomFrom[0] = base.left;   m_zoomFrom[1] = base.top;
+    m_zoomFrom[2] = m_zoomBaseW; m_zoomFrom[3] = m_zoomBaseH;
+    m_zoomTo[0] = tx;            m_zoomTo[1] = ty;
+    m_zoomTo[2] = tw;            m_zoomTo[3] = th;
+
+    LARGE_INTEGER now = {};
+    QueryPerformanceCounter(&now);
+    timeBeginPeriod(1);   // 1ms Sleep resolution for the ticker thread
+    m_zoomStartQpc = now.QuadPart;
+    m_zoomStartTick = GetTickCount();
+    ZoomStartTicker();
+    ZoomAnimStep();
+}
+
+void FenceWindow::ZoomFinishOpen() {
+    ZoomStopTicker();
+    timeEndPeriod(1);
+    m_zoomOpening = false;
+    m_zoomClosing = false;
+    m_zoomFrame = 0;
+    FenceAppearance& app = m_render->Appearance();
+    app.cellW = m_zoomFinalCellW;
+    app.cellH = m_zoomFinalCellH;
+    app.imgSize = m_zoomFinalImg;
+    for (auto& ic : m_icons) {
+        for (const auto& t : m_zoomTracks) {
+            if (t.path == ic.path) { ic.x = t.zoomX; ic.y = t.zoomY; break; }
+        }
+    }
+    ZoomHideOthers();
+    ZoomOverlay::SetFade(1.0f);
+    Redraw();
+    ScheduleBackdropRefresh();
+}
+
+void FenceWindow::ZoomRestoreIconMetrics() {
+    if (!m_iconScaled) return;
+    FenceAppearance& app = m_render->Appearance();
+    app.cellW = m_zoomCellW;
+    app.cellH = m_zoomCellH;
+    app.imgSize = m_zoomImg;
+    app.iconSize = m_zoomIconSize;
+    for (auto& ic : m_icons) {
+        for (const auto& t : m_zoomTracks) {
+            if (t.path == ic.path) { ic.x = t.baseX; ic.y = t.baseY; break; }
+        }
+    }
+    m_render->RebuildStyles();
+    m_zoomTracks.clear();
+    m_iconScaled = false;
+}
+
+void FenceWindow::ZoomFinishClose() {
+    ZoomStopTicker();
+    timeEndPeriod(1);
+    m_zoomOpening = false;
+    m_zoomClosing = false;
+    m_zoomed = false;
+    m_zoomBaseValid = false;
+    m_zoomFrame = 0;
+    if ((int)m_render->Width() != m_zoomBaseW || (int)m_render->Height() != m_zoomBaseH)
+        m_render->Resize(m_zoomBaseW, m_zoomBaseH);
+    ZoomRestoreIconMetrics();
+    RelayoutIcons();
+    ZoomOverlay::Close();
+    ZoomRestoreOthers();
+    SetWindowPos(m_hwnd, HWND_TOP, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    Redraw();
+    ScheduleBackdropRefresh();
+}
+
+void FenceWindow::ZoomStallCheck() {
+    if (!m_zoomOpening) return;
+    LARGE_INTEGER now = {}, freq = {};
+    QueryPerformanceCounter(&now);
+    QueryPerformanceFrequency(&freq);
+    double elapsedMs = (double)(now.QuadPart - m_zoomStartQpc) * 1000.0 / (double)freq.QuadPart;
+    if (elapsedMs < 800.0) return;
+    m_zoomStartQpc = now.QuadPart - (LONGLONG)((double)freq.QuadPart * kZoomDurationMs / 1000.0);
+    int guard = 0;
+    while (m_zoomOpening && guard++ < 4)
+        ZoomAnimStep();
+}
+
+void FenceWindow::ZoomRequestClose() {
+    if (!m_zoomed) return;
+    if (m_zoomOpening) {
+        if (m_zoomClosing) return;
+        // Land the opening first; then reverse from the target rect.
+        LARGE_INTEGER now = {}, freq = {};
+        QueryPerformanceCounter(&now);
+        QueryPerformanceFrequency(&freq);
+        m_zoomStartQpc = now.QuadPart - (LONGLONG)((double)freq.QuadPart * kZoomDurationMs / 1000.0);
+        m_zoomInStep = false;
+        ZoomAnimStep();
+        if (!m_zoomed) return;
+    }
+    ZoomRestoreOthers();
+
+    RECT wr = {};
+    if (GetWindowRect(m_hwnd, &wr)) { m_x = wr.left; m_y = wr.top; }
+    m_zoomFrom[0] = m_x;
+    m_zoomFrom[1] = m_y;
+    m_zoomFrom[2] = (int)m_render->Width();
+    m_zoomFrom[3] = (int)m_render->Height();
+    m_zoomTo[0] = m_zoomBaseX;
+    m_zoomTo[1] = m_zoomBaseY;
+    m_zoomTo[2] = m_zoomBaseW;
+    m_zoomTo[3] = m_zoomBaseH;
+
+    m_zoomClosing = true;
+    m_zoomOpening = true;
+    m_zoomFrame = 0;
+    LARGE_INTEGER now = {};
+    QueryPerformanceCounter(&now);
+    timeBeginPeriod(1);
+    m_zoomStartQpc = now.QuadPart;
+    m_zoomStartTick = GetTickCount();
+    ZoomStartTicker();
+    ZoomAnimStep();
+}
+
+void FenceWindow::ZoomStartTicker() {
+    ZoomStopTicker();
+    m_zoomTickerStop.store(false, std::memory_order_relaxed);
+    HWND hwnd = m_hwnd;
+    m_zoomTicker = std::thread([this, hwnd]() {
+        while (!m_zoomTickerStop.load(std::memory_order_relaxed)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(kZoomFrameMs));
+            if (m_zoomTickerStop.load(std::memory_order_relaxed)) break;
+            if (!hwnd || !IsWindow(hwnd)) break;
+            PostMessageW(hwnd, WM_APP_ZOOM_TICK, 0, 0);
+        }
+    });
+}
+
+void FenceWindow::ZoomStopTicker() {
+    m_zoomTickerStop.store(true, std::memory_order_relaxed);
+    if (m_zoomTicker.joinable()) m_zoomTicker.join();
+}
+
+void FenceWindow::ZoomAnimStep() {
+    if (!m_zoomOpening || m_zoomInStep || !m_hwnd) return;
+    m_zoomInStep = true;
+
+    LARGE_INTEGER now = {}, freq = {};
+    QueryPerformanceCounter(&now);
+    QueryPerformanceFrequency(&freq);
+    double elapsedMs = (double)(now.QuadPart - m_zoomStartQpc) * 1000.0 / (double)freq.QuadPart;
+    float u = (float)(elapsedMs / (double)kZoomDurationMs);
+    if (u < 0.0f) u = 0.0f;
+    if (u > 1.0f) u = 1.0f;
+    float e = EaseInOutCubic(u);
+    m_zoomFrame++;
+
+    int x = m_zoomFrom[0] + (int)((m_zoomTo[0] - m_zoomFrom[0]) * e);
+    int y = m_zoomFrom[1] + (int)((m_zoomTo[1] - m_zoomFrom[1]) * e);
+    int w = m_zoomFrom[2] + (int)((m_zoomTo[2] - m_zoomFrom[2]) * e);
+    int h = m_zoomFrom[3] + (int)((m_zoomTo[3] - m_zoomFrom[3]) * e);
+    if (w < 1) w = 1;
+    if (h < 1) h = 1;
+
+    m_x = x;
+    m_y = y;
+    ZoomApplyFrame(e, w, h);
+    ZoomDrawFrame(w, h);
+    m_render->PresentCropped(m_hwnd, x, y, w, h);
+    ZoomOverlay::SetFade(m_zoomClosing ? 1.0f - e : e);
+
+    if (u >= 1.0f - 1e-5f) {
+        KillTimer(m_hwnd, kZoomTimerId);
+        if (m_zoomClosing) ZoomFinishClose();
+        else               ZoomFinishOpen();
+    }
+    m_zoomInStep = false;
+}
+
 void FenceWindow::ScheduleBackdropRefresh() {
     if (!m_hwnd || !IsWindow(m_hwnd)) return;
     // Same debounce the move/resize path uses (WM_WINDOWPOSCHANGED); timer-2
@@ -776,6 +1207,9 @@ void FenceWindow::ScheduleBackdropRefresh() {
 void FenceWindow::RestoreAnchor() {
     if (!m_hwnd || !IsWindow(m_hwnd)) return;
     if (m_moving || m_resizeMask || m_dragIcon >= 0 || m_marquee) return;
+    // The zoom deliberately parks the fence away from its saved anchor;
+    // restoring it here would drag the animation back mid-flight.
+    if (m_zoomed || m_zoomOpening) return;
     RECT wr;
     if (!GetWindowRect(m_hwnd, &wr)) return;
 
@@ -814,8 +1248,18 @@ void FenceWindow::RestoreAnchor() {
 }
 
 void FenceWindow::CaptureBackdrop() {
+    // During the flight the renderer is a scaled snapshot, not the live
+    // desktop; capture once the animation lands (timer-2 is re-armed).
+    if (m_zoomOpening) { ScheduleBackdropRefresh(); return; }
     int w = (int)m_render->Width(), h = (int)m_render->Height();
     if (w <= 0 || h <= 0) return;
+    // Snapshot where the window actually is. m_x/m_y are only a cache of
+    // the last WM_WINDOWPOSCHANGED, and a zoom frame can repaint before the
+    // cached pair catches up; sampling from the cache shifted the frosted
+    // backdrop by the animation delta.
+    RECT live = {};
+    int sx = m_x, sy = m_y;
+    if (GetWindowRect(m_hwnd, &live)) { sx = live.left; sy = live.top; }
 
     // Snapshot the desktop area behind the fence. Windows excludes
     // WS_EX_LAYERED windows (including this one) from GDI screen captures,
@@ -835,7 +1279,7 @@ void FenceWindow::CaptureBackdrop() {
     if (dib) {
         HDC memDC = CreateCompatibleDC(screenDC);
         HGDIOBJ oldBmp = SelectObject(memDC, dib);
-        BitBlt(memDC, 0, 0, w, h, screenDC, m_x, m_y, SRCCOPY);
+        BitBlt(memDC, 0, 0, w, h, screenDC, sx, sy, SRCCOPY);
         if (bits) m_render->SetBackdrop((const BYTE*)bits, w, h);
         SelectObject(memDC, oldBmp);
         DeleteDC(memDC);
@@ -846,6 +1290,11 @@ void FenceWindow::CaptureBackdrop() {
 }
 
 FenceData FenceWindow::GetData() const {
+    // While zoomed, report the remembered pre-zoom rect: a config save fired
+    // by any unrelated action must not snapshot the transient fly-out.
+    if (m_zoomed && m_zoomBaseValid) {
+        return { m_id, m_title, m_zoomBaseX, m_zoomBaseY, m_zoomBaseW, m_zoomBaseH, true, m_sourceFolder, m_sortColumn, m_sortAscending };
+    }
     return { m_id, m_title, m_x, m_y, (int)m_render->Width(), (int)m_render->Height(), true, m_sourceFolder, m_sortColumn, m_sortAscending };
 }
 
@@ -1497,6 +1946,9 @@ LRESULT CALLBACK FenceWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     }
     case WM_SIZE: {
         UINT w = LOWORD(lp), h = HIWORD(lp);
+        // The zoom flight owns a fixed target-size render target; the window
+        // rect is set by UpdateLayeredWindow and must never resize it.
+        if (self && self->m_zoomOpening) return 0;
         if (self && w > 0 && h > 0 && (w != self->m_render->Width() || h != self->m_render->Height())) {
             self->m_render->Resize(w, h);
             // Re-seat the icons on the resized grid (also resolves overlaps
@@ -1526,12 +1978,16 @@ LRESULT CALLBACK FenceWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         // remember the starting rect/cursor and follow WM_MOUSEMOVE.
         if (!self) return DefWindowProc(hwnd, msg, wp, lp);
         int code = (int)wp;
+        if (self->m_zoomed) return 0;   // fixed canvas while zoomed
         if (code >= HTLEFT && code <= HTBOTTOMRIGHT) {
             int mask = 0;
             if (code == HTLEFT || code == HTTOPLEFT || code == HTBOTTOMLEFT)      mask |= 1;
             if (code == HTRIGHT || code == HTTOPRIGHT || code == HTBOTTOMRIGHT)   mask |= 2;
             if (code == HTTOP || code == HTTOPLEFT || code == HTTOPRIGHT)         mask |= 4;
             if (code == HTBOTTOM || code == HTBOTTOMLEFT || code == HTBOTTOMRIGHT) mask |= 8;
+            // While zoomed an edge drag fine-tunes the zoom rect itself:
+            // the zoom stays armed and the shade stays up; closing still
+            // flies home to the remembered base rect.
             POINT pt{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };   // screen coords
             RECT wr; GetWindowRect(hwnd, &wr);
             HWND parent = GetParent(hwnd);
@@ -1610,8 +2066,13 @@ LRESULT CALLBACK FenceWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             }
             // Rest of the title bar → drag the whole fence. Manual capture
             // drag: DefWindowProc's HTCAPTION loop doesn't move child windows.
+            // Remember the press point: on a collapsed fence a release that
+            // never traveled SM_CXDRAG is a plain click and expands it.
             self->m_moveOffX = mx;
             self->m_moveOffY = my;
+            self->m_pressX = mx;
+            self->m_pressY = my;
+            self->m_pressMoved = false;
             self->m_moving = true;
             SetCapture(hwnd);
             return 0;
@@ -1627,6 +2088,15 @@ LRESULT CALLBACK FenceWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         int hit = self->HitTestIcon(mx, my);
         if (hit >= 0) {
             std::wstring pressedPath = self->m_icons[hit].path;
+            if (self->m_iconScaled) {
+                // The zoom view is a centered layout; the base drag/snap math
+                // would yank icons back to the left-aligned grid. Keep clicks
+                // (select) and double-clicks (open) working, but do not drag.
+                if (!self->IsPathSelected(pressedPath)) self->SelectOnly(hit);
+                self->m_hoverIcon = hit;
+                self->Redraw();
+                return 0;
+            }
             // Explorer selection rule: pressing an already-selected icon
             // keeps the multi-selection (the whole group will drag
             // together); pressing any other icon collapses it to a single.
@@ -1754,8 +2224,17 @@ LRESULT CALLBACK FenceWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             return 0;
         }
         if (self && self->m_moving) {
+            // Click/drag discrimination for the title press: a release that
+            // never traveled SM_CXDRAG is a plain click (on a collapsed fence
+            // that click expands it — settled in WM_LBUTTONUP).
+            int mx = GET_X_LPARAM(lp), my = GET_Y_LPARAM(lp);
+            if (!self->m_pressMoved) {
+                int t = GetSystemMetrics(SM_CXDRAG);
+                if (abs(mx - self->m_pressX) >= t || abs(my - self->m_pressY) >= t)
+                    self->m_pressMoved = true;
+            }
             // Cursor to parent-client coords, keep the grabbed offset
-            POINT p{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+            POINT p{ mx, my };
             ClientToScreen(hwnd, &p);
             HWND parent = GetParent(hwnd);
             if (parent) ScreenToClient(parent, &p);
@@ -1859,11 +2338,20 @@ LRESULT CALLBACK FenceWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             // on empty ground — the selection was already cleared at press
             // time (additive mode left it alone). A real sweep keeps the
             // band's final selection. Either way: drop the band's state.
+            bool plainClick = !self->m_marqueeMoved && !self->m_marqueeAdd;
             self->m_marquee = false;
             self->m_marqueeMoved = false;
             self->m_marqueeAdd = false;
             self->m_marqueeBase.clear();
-            self->Redraw();   // erase the rubber band
+            // Plain blank click (no Ctrl, no sweep): opens the zoom, or —
+            // while already zoomed — collapses it again (the dimmed shade
+            // is the other dismissal path).
+            if (plainClick) {
+                if (self->m_zoomed) self->ZoomRequestClose();
+                else               self->ZoomOpen();
+            } else {
+                self->Redraw();   // erase a real rubber band (a plain click has none)
+            }
         }
         if (self->m_dragIcon >= 0) {
             // Mouse capture routed every move to the drag path, so the hover
@@ -1874,10 +2362,17 @@ LRESULT CALLBACK FenceWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             self->SettleDragGroup();
         }
         bool geomChanged = self->m_moving || self->m_resizeMask;
+        // A collapsed fence's title press that never became a drag was a
+        // plain click → expand it (the chevron already toggles both ways;
+        // this gives the whole pill one-click open).
+        bool plainTitleClick = self->m_moving && self->m_collapsed && !self->m_pressMoved;
         self->m_moving = false;
+        self->m_pressMoved = false;
         self->m_resizeMask = 0;
         if (wasBusy) ReleaseCapture();
-        if (geomChanged) Config::MarkDirty();   // fence moved / resized
+        if (plainTitleClick)
+            self->ToggleCollapse();                 // expand; saves on its own
+        else if (geomChanged) Config::MarkDirty();   // fence moved / resized
         return 0;
     }
     case WM_CAPTURECHANGED: {
@@ -1900,6 +2395,7 @@ LRESULT CALLBACK FenceWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             }
             if (self->m_moving || self->m_resizeMask) Config::MarkDirty();
             self->m_moving = false;
+            self->m_pressMoved = false;
             self->m_resizeMask = 0;
         }
         return 0;
@@ -2373,7 +2869,17 @@ LRESULT CALLBACK FenceWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         } else if (wp == 5) {
             KillTimer(hwnd, 5);
             self->RefreshFromSource();
+        } else if (wp == kZoomTimerId) {
+            self->ZoomAnimStep();
         }
+        return 0;
+
+    case WM_APP_ZOOM_TICK:
+        if (self) self->ZoomAnimStep();
+        return 0;
+
+    case ZoomOverlay::kOutsideClickMessage:
+        if (self) self->ZoomRequestClose();
         return 0;
 
     case WM_FENCE_REFRESH:
@@ -2405,7 +2911,17 @@ LRESULT CALLBACK FenceWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return DefWindowProc(hwnd, msg, wp, lp);
 
     case WM_DESTROY:
-        if (self) { self->StopSourceWatch(); SetWindowLongPtr(hwnd, GWLP_USERDATA, 0); }
+        if (self) {
+            // The zoom's hidden siblings must not stay hidden when this
+            // fence (their reason for hiding) goes away.
+            if (!s_teardown) self->ZoomRestoreOthers();
+            else             self->m_zoomHidden.clear();
+            if (self->m_zoomed || self->m_zoomOpening) ZoomOverlay::Close();
+            self->m_zoomed = false;
+            self->m_zoomOpening = false;
+            self->m_zoomClosing = false;
+            self->StopSourceWatch(); SetWindowLongPtr(hwnd, GWLP_USERDATA, 0);
+        }
         return 0;
     }
     return DefWindowProc(hwnd, msg, wp, lp);

@@ -11,6 +11,7 @@
 #include "context_menu.h"
 #include "menu_icons.h"
 #include "config.h"
+#include "zoom_overlay.h"
 #include "resource.h"
 #include <vector>
 #include <memory>
@@ -311,7 +312,8 @@ void ShowTrayMenu(HWND hwnd) {
         CreateDesktopShortcut();
     } else if (cmd == 102) {
         Config::SaveNow();   // do not ride on the debounce for a real exit
-        Shell_NotifyIconW(NIM_DELETE, &NOTIFYICONDATAW{sizeof(NOTIFYICONDATAW), hwnd, 1});
+        NOTIFYICONDATAW nid = { sizeof(NOTIFYICONDATAW), hwnd, 1 };
+        Shell_NotifyIconW(NIM_DELETE, &nid);
         PostQuitMessage(0);
     }
 }
@@ -324,12 +326,17 @@ static void RebuildFences() {
     // state (the watcher re-parks on the next tick if explorer still hides
     // the list).
     g_extParked = false;
+    // The old desktop tree is gone with the shade; drop it before clearing
+    // fences so no stale shade/hook survives the rebuild.
+    ZoomOverlay::Close();
+    FenceWindow::SetTeardown(true);
     struct Saved { FenceData data; std::vector<IconEntry> icons; bool collapsed; };
     std::vector<Saved> saved;
     saved.reserve(g_fences.size());
     for (auto& f : g_fences)
         saved.push_back({ f->GetData(), f->Icons(), f->IsCollapsed() });
     g_fences.clear();   // dtors see the dead HWNDs and skip DestroyWindow
+    FenceWindow::SetTeardown(false);
     for (auto& s : saved) {
         auto f = std::make_unique<FenceWindow>(s.data);
         if (!s.data.sourceFolder.empty()) {
@@ -381,6 +388,9 @@ LRESULT CALLBACK OwnerWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             // opens explorer's process — not worth repeating per fence).
             int px = QueryDesktopIconSizePx();
             for (auto& f : g_fences) {
+                // A zoom flight that lost its ticker must not freeze the
+                // desktop half-open.
+                f->ZoomStallCheck();
                 // Display topology changes move the desktop icon list; keep
                 // every fence at its saved screen position.
                 f->RestoreAnchor();
@@ -406,7 +416,8 @@ LRESULT CALLBACK OwnerWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_DESTROY:
         Config::SaveNow();   // safety net; the tray Exit path saves too
-        Shell_NotifyIconW(NIM_DELETE, &NOTIFYICONDATAW{sizeof(NOTIFYICONDATAW), hwnd, 1});
+        NOTIFYICONDATAW nid = { sizeof(NOTIFYICONDATAW), hwnd, 1 };
+        Shell_NotifyIconW(NIM_DELETE, &nid);
         PostQuitMessage(0); return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
@@ -482,6 +493,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
+    ZoomOverlay::Close();
+    FenceWindow::SetTeardown(true);
     g_fences.clear();
     return 0;
 }

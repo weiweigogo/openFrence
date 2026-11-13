@@ -50,7 +50,7 @@ RenderContext::RenderContext(UINT w, UINT h) : m_width(w), m_height(h) {
     CreateBrushes();
     CreateTextFormats();
     BuildChevronPath();
-    BuildTitleBarPaths();
+    BuildTitleBarPaths((float)m_width, (float)m_height);
     CreateDibDC();
 }
 
@@ -143,6 +143,11 @@ bool RenderContext::AdoptDesktopIconSize(int physicalPx) {
 
 RenderContext::~RenderContext() {
     m_iconCache.clear();
+    if (m_presentDC) {
+        if (m_presentOld) SelectObject(m_presentDC, m_presentOld);
+        if (m_presentDib) DeleteObject(m_presentDib);
+        DeleteDC(m_presentDC);
+    }
     if (m_memDC && m_oldBmp) {
         SelectObject(m_memDC, m_oldBmp);
         DeleteObject(m_dib);
@@ -235,15 +240,16 @@ void RenderContext::BuildChevronPath() {
     m_chevronPath = path;
 }
 
-void RenderContext::BuildTitleBarPaths() {
+void RenderContext::BuildTitleBarPaths(float w, float h) {
     m_titleBarPath.Release();
     m_topHiPath.Release();
+    m_pathW = w; m_pathH = h;
     if (!m_d2dFactory) return;
-    const float w = (float)m_width, th = m_app.titleH;
+    const float th = m_app.titleH;
     // Match D2D's rounded-rect clamp: a radius larger than half a side
     // collapses, so the window's real top arc is min(r, w/2, h/2).
     const float effR = (std::min)(m_app.r,
-        (std::min)((std::min)(w, (float)m_height) * 0.5f, th));
+        (std::min)((std::min)(w, h) * 0.5f, th));
     if (effR <= 0.5f) return;   // degenerate — caller falls back to plain rects
 
     CComPtr<ID2D1PathGeometry> title;
@@ -339,7 +345,7 @@ void RenderContext::RebuildStyles() {
     CreateBrushes();
     CreateTextFormats();
     BuildChevronPath();   // geometry follows the (possibly changed) titleH
-    BuildTitleBarPaths();
+    BuildTitleBarPaths((float)m_width, (float)m_height);
     // Label metrics depend on the icon text format — stale after a rebuild.
     m_selLabelPath.clear();
 }
@@ -582,39 +588,41 @@ static void ApplyNoise(BYTE* px, int w, int h) {
     }
 }
 
-void RenderContext::SetBackdrop(const BYTE* bgrx, int w, int h) {
-    if (!bgrx || w <= 0 || h <= 0) return;
-
+bool BuildBlurredBackdrop(const BYTE* bgrx, int w, int h,
+                          std::vector<BYTE>& out, int& outW, int& outH) {
+    if (!bgrx || w <= 0 || h <= 0) return false;
     std::vector<BYTE> px((size_t)w * h * 4);
     memcpy(px.data(), bgrx, px.size());
 
-    // Downsample twice (2×2 box average per level) to ¼ size before
-    // blurring. Each level wants >= 8 px in both dimensions to keep the
-    // following blur meaningful — collapsed fences are only ~34 px tall,
-    // so they still pass one or two levels.
     int cw = w, ch = h;
     for (int level = 0; level < 2; level++) {
         if (cw < 8 || ch < 8) break;
-        // (Not "small": rpcndr.h #defines that token to `char`.)
         std::vector<BYTE> down((size_t)(cw / 2) * (ch / 2) * 4);
         HalfSizeBox(down.data(), px.data(), cw, ch);
         px = std::move(down);
         cw /= 2; ch /= 2;
     }
 
-    // Blur on the small image: 2 passes per axis approximate a Gaussian.
     std::vector<BYTE> tmp(px.size());
     const int r = 5;
     for (int pass = 0; pass < 2; pass++) {
         BlurRows(tmp.data(), px.data(), cw, ch, r);
         BlurCols(px.data(), tmp.data(), cw, ch, r);
     }
-
-    // Acrylic finishing passes on the blurred image: +25 % saturation so
-    // the glass reads colorful instead of gray, then a fixed-seed grain
-    // that breaks up the banding a box blur leaves in flat regions.
     SaturatePx(px.data(), cw, ch, 1.25f);
     ApplyNoise(px.data(), cw, ch);
+
+    out = std::move(px);
+    outW = cw; outH = ch;
+    return true;
+}
+
+void RenderContext::SetBackdrop(const BYTE* bgrx, int w, int h) {
+    if (!bgrx || w <= 0 || h <= 0) return;
+
+    std::vector<BYTE> px;
+    int cw = 0, ch = 0;
+    if (!BuildBlurredBackdrop(bgrx, w, h, px, cw, ch)) return;
 
     // Upload the SMALL image through WIC → D2D bitmap. The render target
     // runs at 96 DPI, so bitmap pixels map 1:1 to window pixels.
@@ -667,8 +675,11 @@ bool RenderContext::DrawFence(const std::wstring& title,
                                const RECT* marquee,
                                bool chevronHover, bool chevronDown,
                                float scrollY,
-                               const FenceViewState* view) {
-    float w = (float)m_width, h = (float)m_height;
+                               const FenceViewState* view,
+                               bool noBackdrop, float drawW, float drawH) {
+    float w = drawW > 0.0f ? drawW : (float)m_width;
+    float h = drawH > 0.0f ? drawH : (float)m_height;
+    if (w != m_pathW || h != m_pathH) BuildTitleBarPaths(w, h);
     float r = m_app.r, th = m_app.titleH;
     auto& ctx = *m_d2dTarget.p;
 
@@ -711,7 +722,7 @@ bool RenderContext::DrawFence(const std::wstring& title,
     // ── Collapsed: the whole window is the title bar (one rounded pill) ──
     if (collapsed) {
         D2D1_ROUNDED_RECT rr{{0, 0, w, h}, r, r};
-        if (m_backdropBrush) ctx.FillRoundedRectangle(rr, m_backdropBrush.p);
+        if (m_backdropBrush && !noBackdrop) ctx.FillRoundedRectangle(rr, m_backdropBrush.p);
         if (renaming) {
             CComPtr<ID2D1SolidColorBrush> eb;
             ctx.CreateSolidColorBrush(D2D1::ColorF(0.10f, 0.22f, 0.42f, 0.92f), &eb);
@@ -738,7 +749,7 @@ bool RenderContext::DrawFence(const std::wstring& title,
     // ── Background ──
     D2D1_ROUNDED_RECT rr{{0, 0, w, h}, r, r};
     // Frosted glass: blurred desktop snapshot first, translucent tint on top.
-    if (m_backdropBrush) {
+    if (m_backdropBrush && !noBackdrop) {
         ctx.FillRoundedRectangle(rr, m_backdropBrush.p);
     }
     ctx.FillRoundedRectangle(rr, m_bgBrush.p);
@@ -1239,6 +1250,72 @@ bool RenderContext::CopyWicToDib() {
     bmi.bmiHeader.biCompression = BI_RGB;
     SetDIBits(m_memDC, m_dib, 0, m_height, src, &bmi, DIB_RGB_COLORS);
     return true;
+}
+
+bool RenderContext::CopyWicRegionToPresent(int w, int h) {
+    if (!m_wicBitmap || w <= 0 || h <= 0) return false;
+    if (!m_presentDC || (UINT)w > m_presentW || (UINT)h > m_presentH) {
+        if (m_presentDC) {
+            if (m_presentOld) SelectObject(m_presentDC, m_presentOld);
+            if (m_presentDib) DeleteObject(m_presentDib);
+            DeleteDC(m_presentDC);
+            m_presentDC = nullptr; m_presentDib = nullptr;
+            m_presentBits = nullptr; m_presentOld = nullptr;
+        }
+        UINT aw = (std::max)((UINT)w, m_width);
+        UINT ah = (std::max)((UINT)h, m_height);
+        HDC screen = GetDC(nullptr);
+        BITMAPINFO bmi = {};
+        bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bmi.bmiHeader.biWidth = (LONG)aw;
+        bmi.bmiHeader.biHeight = -(LONG)ah;
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = BI_RGB;
+        void* bits = nullptr;
+        m_presentDib = CreateDIBSection(screen, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
+        ReleaseDC(nullptr, screen);
+        if (!m_presentDib || !bits) { m_presentDib = nullptr; return false; }
+        m_presentBits = bits;
+        m_presentDC = CreateCompatibleDC(nullptr);
+        if (!m_presentDC) { DeleteObject(m_presentDib); m_presentDib = nullptr; return false; }
+        m_presentOld = SelectObject(m_presentDC, m_presentDib);
+        m_presentW = aw; m_presentH = ah;
+    }
+
+    CComPtr<IWICBitmapLock> lock;
+    if (FAILED(m_wicBitmap->Lock(nullptr, WICBitmapLockRead, &lock))) return false;
+    UINT stride = 0, size = 0;
+    BYTE* src = nullptr;
+    if (FAILED(lock->GetStride(&stride)) || FAILED(lock->GetDataPointer(&size, &src)) ||
+        !src || stride < (UINT)w * 4) return false;
+    BYTE* dst = (BYTE*)m_presentBits;
+    const size_t row = (size_t)w * 4;
+    const size_t dstStride = (size_t)m_presentW * 4;
+    for (int y = 0; y < h; y++)
+        memcpy(dst + (size_t)y * dstStride, src + (size_t)y * stride, row);
+    return true;
+}
+
+bool RenderContext::PresentCropped(HWND hwnd, int x, int y, int w, int h) {
+    if (w <= 0 || h <= 0) return false;
+    if (!CopyWicRegionToPresent(w, h)) return false;
+    HDC screenDC = GetDC(nullptr);
+    BLENDFUNCTION blend = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+    POINT ptDst = { x, y }, ptSrc = { 0, 0 };
+    if (GetWindowLongW(hwnd, GWL_STYLE) & WS_CHILD) {
+        HWND parent = GetParent(hwnd);
+        if (parent) ScreenToClient(parent, &ptDst);
+    }
+    SIZE size = { w, h };
+    UpdateLayeredWindow(hwnd, screenDC, &ptDst, &size, m_presentDC, &ptSrc, 0, &blend, ULW_ALPHA);
+    ReleaseDC(nullptr, screenDC);
+    return true;
+}
+
+void RenderContext::WarmIcons(const std::vector<IconEntry>& icons) {
+    for (const auto& ic : icons)
+        LoadFileIcon(ic.path);
 }
 
 bool RenderContext::Present(HWND hwnd, int x, int y) {

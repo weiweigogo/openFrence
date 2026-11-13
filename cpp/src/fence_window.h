@@ -6,6 +6,8 @@
 #include <vector>
 #include <memory>
 #include <algorithm>
+#include <thread>
+#include <atomic>
 #include "render.h"
 
 #define WM_FENCE_DELETE  (WM_APP + 100)
@@ -76,6 +78,20 @@ public:
     /// While collapsed, re-apply the window height so a live-edited title bar
     /// height shows immediately (no-op when expanded).
     void SyncCollapsedSize();
+    /// Phone-folder zoom (transient, never persisted): a plain click on empty
+    /// body ground flies the fence to a large centered rect while a dim
+    /// blurred shade (ZoomOverlay) covers the rest of the desktop; a click on
+    /// the shade flies it back. Drives its own animation on timer 6.
+    void ZoomOpen();
+    /// Dismiss request from the shade (a click on the dimmed backdrop).
+    void ZoomRequestClose();
+    /// Owner-timer watchdog entry point: force-finishes a stalled animation.
+    void ZoomStallCheck();
+    bool IsZoomed() const { return m_zoomed; }
+
+    /// Suppresses the "restore the siblings" pass while main.cpp tears the
+    /// fence list down (the neighbours are being destroyed too).
+    static void SetTeardown(bool on) { s_teardown = on; }
 
     // Display mode save/restore: called by the settings panel before/after
     // switching between grid (0) and list (1) mode.
@@ -118,6 +134,8 @@ public:
 
 private:
     static LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
+    void DrawContent(float drawW = -1.0f, float drawH = -1.0f,
+                     bool noBackdrop = false);   // WIC target only, no Present
     void CaptureBackdrop();   // re-snapshot the desktop behind the fence
     int  HitTestIcon(int mx, int my) const;   // → icon index or -1
     void ClampIconPos(float& x, float& y) const;
@@ -141,6 +159,7 @@ private:
     void SettleDragGroup();          // snap every member + end the drag
     static HWND s_owner;
     static int s_lang;
+    static bool s_teardown;
 
     HWND m_hwnd = nullptr;
     std::unique_ptr<RenderContext> m_render;
@@ -274,4 +293,57 @@ private:
     // the window folded (its height is just the title bar), so the relayout
     // is deferred until the fence expands again.
     bool m_relayoutPending = false;
+
+    // Zoom (transient, never persisted): see ZoomOpen/ZoomRequestClose.
+    // While m_zoomed, GetData reports the remembered base rect so config
+    // saves fired by unrelated actions never snapshot the fly-out geometry.
+    bool m_zoomed      = false;
+    bool m_zoomOpening = false;            // animation in flight (either way)
+    bool m_zoomClosing = false;            // direction of that animation
+    bool m_zoomInStep  = false;            // re-entrancy guard for the timer
+    bool m_zoomBaseValid = false;          // m_zoomBase* holds a saveable rect
+    int  m_zoomFrame   = 0;                // current anim frame
+    int  m_zoomFrames  = 0;                // total frames of the current phase
+    int  m_zoomFrom[4] = {0, 0, 0, 0};     // x,y,w,h lerp source (screen px)
+    int  m_zoomTo[4]   = {0, 0, 0, 0};     // lerp target   (screen px)
+    int  m_zoomBaseX   = 0;                // pre-zoom rect to restore / save
+    int  m_zoomBaseY   = 0;
+    int  m_zoomBaseW   = 0;
+    int  m_zoomBaseH   = 0;
+    // Phone-folder layout interpolation. The base metrics/positions are
+    // remembered for restoration; the final metrics and centered positions
+    // live in the per-icon tracks. Each animation frame sets the icon grid
+    // to a lerp of the two, drawn at the current window size.
+    bool m_iconScaled  = false;
+    float m_zoomCellW  = 0.0f, m_zoomCellH = 0.0f, m_zoomImg = 0.0f, m_zoomIconSize = 0.0f;
+    float m_zoomFinalCellW = 0.0f, m_zoomFinalCellH = 0.0f, m_zoomFinalImg = 0.0f;
+    int   m_zoomTargetW = 0, m_zoomTargetH = 0;
+    struct ZoomTrack {
+        std::wstring path;
+        float baseX = 0.0f, baseY = 0.0f;   // base card coords
+        float zoomX = 0.0f, zoomY = 0.0f;   // target centered-grid coords
+    };
+    std::vector<ZoomTrack> m_zoomTracks;
+    void ZoomAnimStep();
+    void ZoomFinishOpen();
+    void ZoomFinishClose();
+    void ZoomRestoreIconMetrics();
+    void ZoomPrepareTracks();                    // final metrics + per-icon tracks
+    void ZoomApplyFrame(float e, int curW, int curH);
+    void ZoomDrawFrame(int curW, int curH);
+    // WM_TIMER is coalesced to ~31ms on current Windows even with 1ms timer
+    // resolution. A tiny ticker thread posts exact ~8ms ticks to the UI.
+    void ZoomStartTicker();
+    void ZoomStopTicker();
+    std::thread m_zoomTicker;
+    std::atomic<bool> m_zoomTickerStop{ false };
+    LONGLONG m_zoomStartQpc = 0;
+    DWORD m_zoomStartTick = 0;
+    void ZoomHideOthers();                 // other fences vanish while zoomed
+    void ZoomRestoreOthers();
+    std::vector<HWND> m_zoomHidden;         // only the siblings WE hid
+    // A title-bar press that never traveled SM_CXDRAG was a plain click —
+    // on a collapsed fence that click expands it (press-and-drag still moves).
+    bool m_pressMoved = false;
+    int  m_pressX = 0, m_pressY = 0;
 };

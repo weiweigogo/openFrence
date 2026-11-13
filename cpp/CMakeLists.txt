@@ -32,6 +32,7 @@ add_executable(openfences
     src/menu_icons.cpp
     src/config.cpp
     src/explorer_sort.cpp
+    src/zoom_overlay.cpp
     src/app.rc
 )
 
